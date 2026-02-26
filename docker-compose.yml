@@ -1,0 +1,150 @@
+version: "3.8"
+
+# Khai báo mạng nội bộ rõ ràng
+networks:
+  flashqueue_net:
+    driver: bridge
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: flashqueue_api
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # Chúng ta dùng chung biến môi trường từ hệ thống để API kết nối DB/RabbitMQ
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-jobuser}
+      DB_PASS: ${DB_PASS:-jobpass}
+      DB_NAME: ${DB_NAME:-jobscheduler}
+      RMQ_HOST: rabbitmq
+      RMQ_PORT: 5672
+      RMQ_USER: ${RMQ_USER:-guest}
+      RMQ_PASS: ${RMQ_PASS:-guest}
+    networks:
+      - flashqueue_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: flashqueue_worker
+    restart: unless-stopped
+    ports:
+      - "8081:8081" # Port cho Prometheus lấy metrics
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-jobuser}
+      DB_PASS: ${DB_PASS:-jobpass}
+      DB_NAME: ${DB_NAME:-jobscheduler}
+      RMQ_HOST: rabbitmq
+      RMQ_PORT: 5672
+      RMQ_USER: ${RMQ_USER:-guest}
+      RMQ_PASS: ${RMQ_PASS:-guest}
+    networks:
+      - flashqueue_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:15-alpine # Dùng bản alpine cho nhẹ và bảo mật hơn
+    container_name: flashqueue_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-jobuser}
+      POSTGRES_PASSWORD: ${DB_PASS:-jobpass}
+      POSTGRES_DB: ${DB_NAME:-jobscheduler}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - flashqueue_net
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${DB_USER:-jobuser} -d ${DB_NAME:-jobscheduler}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine # Dùng bản có sẵn UI quản lý và nhẹ (alpine)
+    container_name: flashqueue_rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RMQ_PASS:-guest}
+    ports:
+      - "5672:5672" # Port giao tiếp của App (AMQP)
+      - "15672:15672" # Port của giao diện Dashboard
+    volumes:
+      - rabbitdata:/var/lib/rabbitmq
+    networks:
+      - flashqueue_net
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: flashqueue_prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro # Thêm ro (Read-Only) để bảo mật
+      - prometheus_data:/prometheus # Cần persist data của prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+      - "--web.enable-lifecycle" # Cho phép reload config qua HTTP API
+    ports:
+      - "9090:9090"
+    networks:
+      - flashqueue_net
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: flashqueue_grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASS:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false" # Đóng chức năng cho khách đăng ký
+    volumes:
+      - grafanadata:/var/lib/grafana
+    networks:
+      - flashqueue_net
+    depends_on:
+      - prometheus # Đảm bảo Prom bật trước Grafana
+
+# Khai báo các Volumes có đặt cờ rõ ràng
+volumes:
+  pgdata:
+    name: flashqueue_pgdata
+  rabbitdata:
+    name: flashqueue_rabbitdata
+  grafanadata:
+    name: flashqueue_grafanadata
+  prometheus_data:
+    name: flashqueue_prometheus_data

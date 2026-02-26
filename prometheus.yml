@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 15s     # Đổi thành 15s. 5s cho local là hơi nhanh, làm phình ổ cứng nhanh chóng
+  evaluation_interval: 15s # Chu kỳ tính toán alert
+
+scrape_configs:
+  # Cấu hình tự lấy số liệu nội bộ của chính Prometheus
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Cấu hình lấy số liệu từ API của bạn chạy local
+  - job_name: 'job-scheduler-api'
+    static_configs:
+      # Dùng host.docker.internal khi App chạy ngoài docker (go run)
+      - targets: ['host.docker.internal:8080']
+
+  - job_name: 'job-scheduler-worker'
+    static_configs:
+      - targets: ['host.docker.internal:8081']
