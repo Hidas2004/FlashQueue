@@ -1,0 +1,42 @@
+# ==========================================
+# STAGE 1: Builder (Giai đoạn xây dựng)
+# ==========================================
+# Sử dụng base image là golang (chứa đầy đủ công cụ build)
+FROM golang:1.22-alpine AS builder
+
+# Thiết lập thư mục làm việc trong container
+WORKDIR /app
+
+# Cài đặt các OS packages cần thiết
+RUN apk add --no-cache git tzdata
+
+# Copy go.mod và go.sum vào trước. 
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Sau khi tải thư viện xong mới copy toàn bộ mã nguồn vào
+COPY . .
+
+# Build ứng dụng Go cho phần Worker
+RUN CGO_ENABLED=0 GOOS=linux go build -o flashqueue-worker ./cmd/worker
+
+# ==========================================
+# STAGE 2: Runner (Giai đoạn chạy)
+# ==========================================
+# Sử dụng base image là alpine siêu nhẹ (~5MB)
+FROM alpine:3.19
+
+# Cài đặt timezone và ca-certificates
+RUN apk --no-cache add ca-certificates tzdata
+
+WORKDIR /app
+
+# COPY file nhị phân từ 'builder' stage 
+COPY --from=builder /app/flashqueue-worker .
+
+# Worker thường không cần mở port ngoài (vì nó chuyên pull message từ RabbitMQ)
+# Tuy nhiên thư viện Prometheus metrics cho Worker chạy trên port 8081, nên ta khai báo để document
+EXPOSE 8081
+
+# Chạy file nhị phân của Worker
+CMD ["./flashqueue-worker"]

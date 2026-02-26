@@ -1,0 +1,50 @@
+# ==========================================
+# STAGE 1: Builder (Giai đoạn xây dựng)
+# ==========================================
+# Sử dụng base image là golang (chứa đầy đủ công cụ build)
+FROM golang:1.22-alpine AS builder
+
+# Thiết lập thư mục làm việc trong container
+WORKDIR /app
+
+# Cài đặt các OS packages cần thiết (nếu code bạn có dùng CGO)
+# Ở đây ta thêm git để tải các dependency
+RUN apk add --no-cache git tzdata
+
+# Copy go.mod và go.sum vào trước. 
+# MẸO: Làm bước này trước để Docker cache lại các dependency.
+# Nếu source code thay đổi nhưng thư viện không đổi, bước tải thư viện sẽ không phải chạy lại.
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Sau khi tải thư viện xong mới copy toàn bộ mã nguồn vào
+COPY . .
+
+# Build ứng dụng Go
+# CGO_ENABLED=0: Build file nhị phân độc lập, không phụ thuộc vào thư viện C của OS. Rất quan trọng khi chạy trên alpine/scratch.
+# GOOS=linux: Đảm bảo build ra bản chạy cho Linux, kể cả khi bạn đang gõ lệnh trên Windows.
+# -o main: Tên file đầu ra
+# ./cmd/api: Đường dẫn tới thư mục chứa file main.go của phần API
+RUN CGO_ENABLED=0 GOOS=linux go build -o flashqueue-api ./cmd/api
+
+# ==========================================
+# STAGE 2: Runner (Giai đoạn chạy)
+# ==========================================
+# Sử dụng base image là alpine siêu nhẹ (~5MB)
+FROM alpine:3.19
+
+# Cài đặt timezone và ca-certificates (để gọi API HTTPS ra ngoài không bị lỗi SSL)
+RUN apk --no-cache add ca-certificates tzdata
+
+WORKDIR /app
+
+# COPY file nhị phân từ 'builder' stage sang thư mục hiện tại của runner stage
+COPY --from=builder /app/flashqueue-api .
+# COPY tệp tin cấu hình (ví dụ file .env) nếu có
+# COPY --from=builder /app/.env . 
+
+# Khai báo port ứng dụng sử dụng (Chỉ mang tính tài liệu, không có tác dụng map port thật)
+EXPOSE 8080
+
+# Chạy file nhị phân
+CMD ["./flashqueue-api"]
