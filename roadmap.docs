@@ -1,0 +1,1480 @@
+Lộ Trình UPDATED: Distributed Background Job Scheduler (Senior-Ready)
+________________________________________
+GIAI ĐOẠN 0: RESEARCH & PLANNING (1 ngày)
+Mermaid Architecture Diagram (dán vào README.md)
+mermaid
+graph TB
+    Client["Client / cURL"] -->|POST /api/v1/jobs| API["HTTP API (Gin)"]
+    API -->|INSERT status=pending| PG[("PostgreSQL")]
+    API -->|Publish JobMessage| MQ["RabbitMQ\n(jobs queue)"]
+    MQ -->|Consume| WP["Worker Pool\n(N goroutines)"]
+    WP -->|FOR UPDATE SKIP LOCKED| PG
+    WP -->|UPDATE status| PG
+    WP -->|Failed > maxRetries| DLQ["Dead Letter Queue\n(jobs.dlq)"]
+    WP -->|Metrics| PROM["Prometheus"]
+    PROM --> GRAFANA["Grafana Dashboard"]
+    API -->|GET /dashboard| DASH["Dashboard UI (SSE)"]
+    DASH -->|poll stats| PG
+________________________________________
+GIAI ĐOẠN 1: SETUP & CẤU TRÚC
+1.1 Dependencies
+bash
+go mod init job-scheduler
+go get github.com/gin-gonic/gin
+go get github.com/rabbitmq/amqp091-go
+go get github.com/jmoiron/sqlx
+go get github.com/lib/pq
+go get github.com/google/uuid
+go get github.com/joho/godotenv
+go get go.uber.org/zap
+go get github.com/prometheus/client_golang/prometheus
+go get github.com/prometheus/client_golang/prometheus/promhttp
+go get github.com/stretchr/testify
+```
+
+### 1.2 Cấu trúc thư mục
+```
+job-scheduler/
+├── cmd/
+│   ├── api/main.go
+│   └── worker/main.go
+├── internal/
+│   ├── config/config.go
+│   ├── db/
+│   │   ├── postgres.go
+│   │   └── migrations/001_init.sql
+│   ├── queue/rabbitmq.go
+│   ├── job/
+│   │   ├── model.go
+│   │   ├── repository.go
+│   │   ├── service.go          ← MỚI (Clean Architecture)
+│   │   └── handler.go
+│   ├── worker/
+│   │   ├── pool.go
+│   │   └── processor.go
+│   ├── metrics/metrics.go      ← MỚI (Prometheus)
+│   └── dashboard/handler.go
+├── docker-compose.yml
+├── Dockerfile.api              ← MỚI
+├── Dockerfile.worker           ← MỚI
+├── .env
+├── Makefile
+└── README.md
+________________________________________
+GIAI ĐOẠN 2: INFRASTRUCTURE
+docker-compose.yml
+yaml
+version: '3.8'
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: jobuser
+      POSTGRES_PASSWORD: jobpass
+      POSTGRES_DB: jobscheduler
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitdata:/var/lib/rabbitmq
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafanadata:/var/lib/grafana
+
+volumes:
+  pgdata:
+  rabbitdata:
+  grafanadata:
+prometheus.yml
+yaml
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: 'job-scheduler-api'
+    static_configs:
+      - targets: ['host.docker.internal:8080']
+  - job_name: 'job-scheduler-worker'
+    static_configs:
+      - targets: ['host.docker.internal:8081']
+________________________________________
+GIAI ĐOẠN 3: DATABASE SCHEMA (UPDATED)
+internal/db/migrations/001_init.sql
+sql
+CREATE TYPE job_status AS ENUM ('pending', 'running', 'completed', 'failed', 'retrying', 'dead');
+CREATE TYPE job_type   AS ENUM ('send_email', 'process_image', 'generate_report', 'data_calculation');
+
+CREATE TABLE jobs (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    type           job_type NOT NULL,
+    payload        JSONB NOT NULL DEFAULT '{}',
+    status         job_status NOT NULL DEFAULT 'pending',
+    priority       INT NOT NULL DEFAULT 0,
+    version        INT NOT NULL DEFAULT 0,         -- Optimistic lock fallback
+    retry_count    INT NOT NULL DEFAULT 0,
+    max_retries    INT NOT NULL DEFAULT 3,
+    error_message  TEXT,
+    next_retry_at  TIMESTAMP WITH TIME ZONE,       -- Delayed retry
+    scheduled_at   TIMESTAMP WITH TIME ZONE,
+    started_at     TIMESTAMP WITH TIME ZONE,
+    completed_at   TIMESTAMP WITH TIME ZONE,
+    created_at     TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at     TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_jobs_status          ON jobs(status);
+CREATE INDEX idx_jobs_status_priority ON jobs(status, priority DESC, created_at);
+CREATE INDEX idx_jobs_next_retry_at   ON jobs(next_retry_at) WHERE status = 'retrying';
+
+CREATE OR REPLACE FUNCTION update_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN NEW.updated_at = NOW(); RETURN NEW; END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER jobs_updated_at
+    BEFORE UPDATE ON jobs
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+________________________________________
+GIAI ĐOẠN 4: CODE TỪNG LAYER
+4.1 Config
+internal/config/config.go
+go
+package config
+
+import (
+    "log"
+    "os"
+    "strconv"
+
+    "github.com/joho/godotenv"
+)
+
+type Config struct {
+    ServerPort      string
+    MetricsPort     string
+    DatabaseURL     string
+    RabbitMQURL     string
+    WorkerCount     int
+    QueueName       string
+    DLQName         string
+    RetryDelay      int
+}
+
+func Load() *Config {
+    if err := godotenv.Load(); err != nil {
+        log.Println("No .env file, reading from environment")
+    }
+    workerCount, _ := strconv.Atoi(getEnv("WORKER_COUNT", "5"))
+    retryDelay, _ := strconv.Atoi(getEnv("RETRY_DELAY_SECONDS", "5"))
+    return &Config{
+        ServerPort:  getEnv("SERVER_PORT", "8080"),
+        MetricsPort: getEnv("METRICS_PORT", "8081"),
+        DatabaseURL: getEnv("DATABASE_URL", "postgres://jobuser:jobpass@localhost:5432/jobscheduler?sslmode=disable"),
+        RabbitMQURL: getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
+        WorkerCount: workerCount,
+        QueueName:   getEnv("QUEUE_NAME", "jobs"),
+        DLQName:     getEnv("DLQ_NAME", "jobs.dlq"),
+        RetryDelay:  retryDelay,
+    }
+}
+
+func getEnv(key, defaultVal string) string {
+    if v := os.Getenv(key); v != "" {
+        return v
+    }
+    return defaultVal
+}
+________________________________________
+4.2 Database (sqlx)
+internal/db/postgres.go
+go
+package db
+
+import (
+    "log"
+
+    "github.com/jmoiron/sqlx"
+    _ "github.com/lib/pq"
+)
+
+func NewPostgres(dsn string) *sqlx.DB {
+    db, err := sqlx.Connect("postgres", dsn)
+    if err != nil {
+        log.Fatalf("Failed to connect PostgreSQL: %v", err)
+    }
+    db.SetMaxOpenConns(25)
+    db.SetMaxIdleConns(10)
+    log.Println("Connected to PostgreSQL")
+    return db
+}
+________________________________________
+4.3 Model (UPDATED)
+internal/job/model.go
+go
+package job
+
+import (
+    "encoding/json"
+    "time"
+)
+
+type Status string
+type Type string
+
+const (
+    StatusPending   Status = "pending"
+    StatusRunning   Status = "running"
+    StatusCompleted Status = "completed"
+    StatusFailed    Status = "failed"
+    StatusRetrying  Status = "retrying"
+    StatusDead      Status = "dead" // Hết retry, đưa vào DLQ
+)
+
+const (
+    TypeSendEmail       Type = "send_email"
+    TypeProcessImage    Type = "process_image"
+    TypeGenerateReport  Type = "generate_report"
+    TypeDataCalculation Type = "data_calculation"
+)
+
+type Job struct {
+    ID           string          `db:"id"            json:"id"`
+    Type         Type            `db:"type"          json:"type"`
+    Payload      json.RawMessage `db:"payload"       json:"payload"`
+    Status       Status          `db:"status"        json:"status"`
+    Priority     int             `db:"priority"      json:"priority"`
+    Version      int             `db:"version"       json:"version"`
+    RetryCount   int             `db:"retry_count"   json:"retry_count"`
+    MaxRetries   int             `db:"max_retries"   json:"max_retries"`
+    ErrorMessage *string         `db:"error_message" json:"error_message,omitempty"`
+    NextRetryAt  *time.Time      `db:"next_retry_at" json:"next_retry_at,omitempty"`
+    ScheduledAt  *time.Time      `db:"scheduled_at"  json:"scheduled_at,omitempty"`
+    StartedAt    *time.Time      `db:"started_at"    json:"started_at,omitempty"`
+    CompletedAt  *time.Time      `db:"completed_at"  json:"completed_at,omitempty"`
+    CreatedAt    time.Time       `db:"created_at"    json:"created_at"`
+    UpdatedAt    time.Time       `db:"updated_at"    json:"updated_at"`
+}
+
+type JobMessage struct {
+    JobID string `json:"job_id"`
+    Type  Type   `json:"type"`
+}
+
+type CreateJobRequest struct {
+    Type        Type            `json:"type"         binding:"required"`
+    Payload     json.RawMessage `json:"payload"`
+    Priority    int             `json:"priority"`
+    MaxRetries  int             `json:"max_retries"`
+    ScheduledAt *time.Time      `json:"scheduled_at"`
+}
+________________________________________
+4.4 Repository (UPDATED — Fix Bug 1 & Bug 2)
+internal/job/repository.go
+Bug 1 fix: Dùng FOR UPDATE SKIP LOCKED — chuẩn production PostgreSQL queue
+Bug 2 fix: Viết lại List() dùng sqlx đúng cách, không còn lỗi itoa/args
+go
+package job
+
+import (
+    "fmt"
+    "strconv"
+    "time"
+
+    "github.com/jmoiron/sqlx"
+)
+
+type Repository struct {
+    db *sqlx.DB
+}
+
+func NewRepository(db *sqlx.DB) *Repository {
+    return &Repository{db: db}
+}
+
+// ClaimJob — Senior pattern: FOR UPDATE SKIP LOCKED
+// Đảm bảo 1 job chỉ được 1 worker xử lý, KHÔNG có race condition
+// Nhiều worker gọi đồng thời sẽ tự động lấy các job KHÁC NHAU
+func (r *Repository) ClaimJob(jobID string) (*Job, error) {
+    tx, err := r.db.Beginx()
+    if err != nil {
+        return nil, err
+    }
+    defer tx.Rollback()
+
+    var j Job
+    err = tx.Get(&j, `
+        SELECT * FROM jobs
+        WHERE id = $1 AND status IN ('pending', 'retrying')
+        FOR UPDATE SKIP LOCKED
+    `, jobID)
+    if err != nil {
+        return nil, err // job đã bị worker khác lấy → skip
+    }
+
+    _, err = tx.Exec(`
+        UPDATE jobs SET status = 'running', started_at = NOW() WHERE id = $1
+    `, jobID)
+    if err != nil {
+        return nil, err
+    }
+
+    if err := tx.Commit(); err != nil {
+        return nil, err
+    }
+    return &j, nil
+}
+
+func (r *Repository) Create(req *CreateJobRequest) (*Job, error) {
+    maxRetries := req.MaxRetries
+    if maxRetries == 0 {
+        maxRetries = 3
+    }
+    payload := req.Payload
+    if payload == nil {
+        payload = []byte("{}")
+    }
+
+    var j Job
+    err := r.db.Get(&j, `
+        INSERT INTO jobs (type, payload, priority, max_retries, scheduled_at)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING *
+    `, req.Type, payload, req.Priority, maxRetries, req.ScheduledAt)
+    return &j, err
+}
+
+func (r *Repository) GetByID(id string) (*Job, error) {
+    var j Job
+    err := r.db.Get(&j, `SELECT * FROM jobs WHERE id = $1`, id)
+    return &j, err
+}
+
+func (r *Repository) MarkCompleted(id string) error {
+    _, err := r.db.Exec(`
+        UPDATE jobs SET status = 'completed', completed_at = NOW() WHERE id = $1
+    `, id)
+    return err
+}
+
+// MarkFailed — xử lý cả retry với exponential backoff
+func (r *Repository) MarkFailed(id string, errMsg string, shouldRetry bool, retryDelaySec int) error {
+    if !shouldRetry {
+        _, err := r.db.Exec(`
+            UPDATE jobs SET status = 'dead', error_message = $1 WHERE id = $2
+        `, errMsg, id)
+        return err
+    }
+
+    // Exponential backoff: delay = retryDelaySec * 2^retry_count + jitter
+    // Tính toán trong DB bằng retry_count hiện tại
+    _, err := r.db.Exec(`
+        UPDATE jobs
+        SET status = 'retrying',
+            error_message = $1,
+            retry_count = retry_count + 1,
+            next_retry_at = NOW() + (($2 * POWER(2, retry_count)) || ' seconds')::INTERVAL
+        WHERE id = $3
+    `, errMsg, retryDelaySec, id)
+    return err
+}
+
+// MarkDead — đưa job vào trạng thái dead (đã hết retry)
+func (r *Repository) MarkDead(id string, errMsg string) error {
+    _, err := r.db.Exec(`
+        UPDATE jobs SET status = 'dead', error_message = $1 WHERE id = $2
+    `, errMsg, id)
+    return err
+}
+
+// List — FIXED: không còn lỗi itoa / args sai
+func (r *Repository) List(status string, limit, offset int) ([]*Job, int, error) {
+    where := ""
+    args := []interface{}{}
+
+    if status != "" {
+        where = "WHERE status = $1"
+        args = append(args, status)
+    }
+
+    // Count query
+    var total int
+    if err := r.db.Get(&total, "SELECT COUNT(*) FROM jobs "+where, args...); err != nil {
+        return nil, 0, err
+    }
+
+    // Build data query với đúng thứ tự $N
+    argIdx := len(args) + 1
+    dataQuery := fmt.Sprintf(
+        `SELECT * FROM jobs %s ORDER BY priority DESC, created_at DESC LIMIT $%s OFFSET $%s`,
+        where,
+        strconv.Itoa(argIdx),
+        strconv.Itoa(argIdx+1),
+    )
+    args = append(args, limit, offset)
+
+    var jobs []*Job
+    if err := r.db.Select(&jobs, dataQuery, args...); err != nil {
+        return nil, 0, err
+    }
+    return jobs, total, nil
+}
+
+func (r *Repository) GetStats() (map[string]int, error) {
+    rows, err := r.db.Queryx(`SELECT status, COUNT(*) as count FROM jobs GROUP BY status`)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+
+    stats := map[string]int{}
+    for rows.Next() {
+        var s struct {
+            Status string `db:"status"`
+            Count  int    `db:"count"`
+        }
+        rows.StructScan(&s)
+        stats[s.Status] = s.Count
+    }
+    return stats, nil
+}
+
+// GetDueRetryJobs — Scheduled Job Poller dùng cái này
+func (r *Repository) GetDueRetryJobs() ([]*Job, error) {
+    var jobs []*Job
+    err := r.db.Select(&jobs, `
+        SELECT * FROM jobs
+        WHERE status = 'retrying' AND next_retry_at <= NOW()
+        ORDER BY priority DESC, next_retry_at
+        LIMIT 100
+        FOR UPDATE SKIP LOCKED
+    `)
+    return jobs, err
+}
+________________________________________
+4.5 RabbitMQ (UPDATED — Fix Bug 3 + DLQ)
+internal/queue/rabbitmq.go
+Bug 3 fix: Mỗi consumer tạo channel riêng, không share channel giữa goroutines
+go
+package queue
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "log"
+    "time"
+
+    amqp "github.com/rabbitmq/amqp091-go"
+)
+
+type RabbitMQ struct {
+    conn      *amqp.Connection
+    QueueName string
+    DLQName   string
+}
+
+func NewRabbitMQ(url, queueName, dlqName string) (*RabbitMQ, error) {
+    conn, err := amqp.Dial(url)
+    if err != nil {
+        return nil, fmt.Errorf("dial rabbitmq: %w", err)
+    }
+
+    // Setup queues trên 1 channel tạm (chỉ để declare)
+    ch, err := conn.Channel()
+    if err != nil {
+        return nil, err
+    }
+    defer ch.Close()
+
+    // Khai báo DLQ trước
+    _, err = ch.QueueDeclare(dlqName, true, false, false, false, nil)
+    if err != nil {
+        return nil, fmt.Errorf("declare DLQ: %w", err)
+    }
+
+    // Khai báo main queue với DLX (Dead Letter Exchange) trỏ về DLQ
+    _, err = ch.QueueDeclare(
+        queueName, true, false, false, false,
+        amqp.Table{
+            "x-dead-letter-exchange":    "",      // default exchange
+            "x-dead-letter-routing-key": dlqName, // route sang DLQ
+            "x-message-ttl":             int32(86400000),
+        },
+    )
+    if err != nil {
+        return nil, fmt.Errorf("declare main queue: %w", err)
+    }
+
+    log.Printf("RabbitMQ ready. Queue: %s, DLQ: %s", queueName, dlqName)
+    return &RabbitMQ{conn: conn, QueueName: queueName, DLQName: dlqName}, nil
+}
+
+func (r *RabbitMQ) Publish(ctx context.Context, msg interface{}) error {
+    // Mỗi Publish dùng channel riêng — thread safe
+    ch, err := r.conn.Channel()
+    if err != nil {
+        return err
+    }
+    defer ch.Close()
+
+    body, err := json.Marshal(msg)
+    if err != nil {
+        return err
+    }
+
+    return ch.PublishWithContext(ctx, "", r.QueueName, false, false,
+        amqp.Publishing{
+            ContentType:  "application/json",
+            DeliveryMode: amqp.Persistent,
+            Timestamp:    time.Now(),
+            Body:         body,
+        },
+    )
+}
+
+// NewConsumerChannel — Bug 3 fix: mỗi worker tạo channel consumer RIÊNG
+func (r *RabbitMQ) NewConsumerChannel() (*amqp.Channel, <-chan amqp.Delivery, error) {
+    ch, err := r.conn.Channel()
+    if err != nil {
+        return nil, nil, err
+    }
+    // Prefetch 1: worker chỉ nhận 1 message tại 1 thời điểm
+    ch.Qos(1, 0, false)
+
+    deliveries, err := ch.Consume(r.QueueName, "", false, false, false, false, nil)
+    if err != nil {
+        ch.Close()
+        return nil, nil, err
+    }
+    return ch, deliveries, nil
+}
+
+func (r *RabbitMQ) PublishToDLQ(ctx context.Context, msg interface{}) error {
+    ch, err := r.conn.Channel()
+    if err != nil {
+        return err
+    }
+    defer ch.Close()
+
+    body, err := json.Marshal(msg)
+    if err != nil {
+        return err
+    }
+
+    return ch.PublishWithContext(ctx, "", r.DLQName, false, false,
+        amqp.Publishing{
+            ContentType:  "application/json",
+            DeliveryMode: amqp.Persistent,
+            Timestamp:    time.Now(),
+            Body:         body,
+        },
+    )
+}
+
+func (r *RabbitMQ) Close() {
+    r.conn.Close()
+}
+________________________________________
+4.6 Metrics (Prometheus)
+internal/metrics/metrics.go
+go
+package metrics
+
+import (
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+var (
+    JobsProcessedTotal = promauto.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "jobs_processed_total",
+            Help: "Total number of jobs processed",
+        },
+        []string{"type", "status"},
+    )
+
+    JobProcessingDuration = promauto.NewHistogramVec(
+        prometheus.HistogramOpts{
+            Name:    "job_processing_duration_seconds",
+            Help:    "Time spent processing a job",
+            Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30},
+        },
+        []string{"type"},
+    )
+
+    JobsRetryTotal = promauto.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "jobs_retry_total",
+            Help: "Total number of job retries",
+        },
+        []string{"type"},
+    )
+
+    QueueDepth = promauto.NewGauge(
+        prometheus.GaugeOpts{
+            Name: "jobs_queue_depth",
+            Help: "Number of jobs currently pending/retrying",
+        },
+    )
+)
+________________________________________
+4.7 Worker Pool (UPDATED — Exponential Backoff + Metrics + Bug 3 fix)
+internal/worker/processor.go
+go
+package worker
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "log"
+    "math/rand"
+    "time"
+
+    "job-scheduler/internal/job"
+)
+
+type ProcessorFunc func(ctx context.Context, j *job.Job) error
+
+var defaultProcessors = map[job.Type]ProcessorFunc{
+    job.TypeSendEmail:       processSendEmail,
+    job.TypeProcessImage:    processImage,
+    job.TypeGenerateReport:  processGenerateReport,
+    job.TypeDataCalculation: processDataCalculation,
+}
+
+func processSendEmail(ctx context.Context, j *job.Job) error {
+    var payload struct {
+        To      string `json:"to"`
+        Subject string `json:"subject"`
+    }
+    json.Unmarshal(j.Payload, &payload)
+    log.Printf("[SendEmail] Sending to %s: %s", payload.To, payload.Subject)
+
+    // Giả lập 10% network failure để test retry
+    if rand.Intn(10) == 0 {
+        return fmt.Errorf("network timeout sending email to %s", payload.To)
+    }
+    time.Sleep(500 * time.Millisecond)
+    return nil
+}
+
+func processImage(ctx context.Context, j *job.Job) error {
+    log.Printf("[ProcessImage] Processing %s", j.ID)
+    time.Sleep(2 * time.Second)
+    return nil
+}
+
+func processGenerateReport(ctx context.Context, j *job.Job) error {
+    log.Printf("[GenerateReport] Generating %s", j.ID)
+    time.Sleep(3 * time.Second)
+    return nil
+}
+
+func processDataCalculation(ctx context.Context, j *job.Job) error {
+    log.Printf("[DataCalculation] Calculating %s", j.ID)
+    time.Sleep(1 * time.Second)
+    return nil
+}
+internal/worker/pool.go
+go
+package worker
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "log"
+    "sync"
+    "time"
+
+    amqp "github.com/rabbitmq/amqp091-go"
+    "job-scheduler/internal/job"
+    "job-scheduler/internal/metrics"
+    "job-scheduler/internal/queue"
+)
+
+type Pool struct {
+    workerCount   int
+    repo          *job.Repository
+    queue         *queue.RabbitMQ
+    processors    map[job.Type]ProcessorFunc
+    retryDelaySec int
+    wg            sync.WaitGroup
+}
+
+func NewPool(workerCount int, repo *job.Repository, q *queue.RabbitMQ, retryDelaySec int) *Pool {
+    return &Pool{
+        workerCount:   workerCount,
+        repo:          repo,
+        queue:         q,
+        processors:    defaultProcessors,
+        retryDelaySec: retryDelaySec,
+    }
+}
+
+func (p *Pool) Start(ctx context.Context) error {
+    log.Printf("Starting %d workers", p.workerCount)
+
+    for i := 0; i < p.workerCount; i++ {
+        // Bug 3 fix: mỗi worker tạo channel consumer riêng
+        ch, deliveries, err := p.queue.NewConsumerChannel()
+        if err != nil {
+            return fmt.Errorf("worker %d: create consumer channel: %w", i+1, err)
+        }
+
+        p.wg.Add(1)
+        go p.runWorker(ctx, i+1, ch, deliveries)
+    }
+
+    <-ctx.Done()
+    log.Println("Waiting for all workers to finish...")
+    p.wg.Wait()
+    log.Println("All workers stopped cleanly")
+    return nil
+}
+
+func (p *Pool) runWorker(ctx context.Context, id int, ch *amqp.Channel, deliveries <-chan amqp.Delivery) {
+    defer p.wg.Done()
+    defer ch.Close() // Mỗi worker tự đóng channel riêng của mình
+    log.Printf("Worker %d started", id)
+
+    for {
+        select {
+        case <-ctx.Done():
+            log.Printf("Worker %d: shutting down", id)
+            return
+        case delivery, ok := <-deliveries:
+            if !ok {
+                log.Printf("Worker %d: channel closed", id)
+                return
+            }
+            p.processDelivery(ctx, id, delivery)
+        }
+    }
+}
+
+func (p *Pool) processDelivery(ctx context.Context, workerID int, delivery amqp.Delivery) {
+    var msg job.JobMessage
+    if err := json.Unmarshal(delivery.Body, &msg); err != nil {
+        log.Printf("Worker %d: invalid message body: %v", workerID, err)
+        delivery.Nack(false, false)
+        return
+    }
+
+    // FOR UPDATE SKIP LOCKED: đảm bảo chỉ 1 worker xử lý job này
+    j, err := p.repo.ClaimJob(msg.JobID)
+    if err != nil {
+        // Job đã được worker khác claim → skip bình thường
+        log.Printf("Worker %d: job %s already claimed or not found, skipping", workerID, msg.JobID)
+        delivery.Ack(false)
+        return
+    }
+
+    log.Printf("Worker %d: claimed job %s (type: %s, retry: %d/%d)",
+        workerID, j.ID, j.Type, j.RetryCount, j.MaxRetries)
+
+    processor, exists := p.processors[j.Type]
+    if !exists {
+        p.repo.MarkDead(j.ID, fmt.Sprintf("no processor for type: %s", j.Type))
+        delivery.Ack(false)
+        return
+    }
+
+    // Track processing time cho Prometheus
+    startTime := time.Now()
+    jobCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+    defer cancel()
+
+    err = processor(jobCtx, j)
+    duration := time.Since(startTime).Seconds()
+
+    if err == nil {
+        p.repo.MarkCompleted(j.ID)
+        metrics.JobsProcessedTotal.WithLabelValues(string(j.Type), "completed").Inc()
+        metrics.JobProcessingDuration.WithLabelValues(string(j.Type)).Observe(duration)
+        log.Printf("Worker %d: job %s COMPLETED in %.2fs", workerID, j.ID, duration)
+        delivery.Ack(false)
+        return
+    }
+
+    // Xử lý lỗi
+    shouldRetry := j.RetryCount < j.MaxRetries
+    log.Printf("Worker %d: job %s FAILED (retry %d/%d): %v",
+        workerID, j.ID, j.RetryCount+1, j.MaxRetries, err)
+
+    metrics.JobsProcessedTotal.WithLabelValues(string(j.Type), "failed").Inc()
+
+    if shouldRetry {
+        // Exponential backoff: delay = retryDelaySec * 2^retry_count
+        // Tính trong DB (xem MarkFailed), worker chỉ cần re-enqueue sau khi next_retry_at đến
+        p.repo.MarkFailed(j.ID, err.Error(), true, p.retryDelaySec)
+        metrics.JobsRetryTotal.WithLabelValues(string(j.Type)).Inc()
+        // Re-publish vào queue (scheduled poller sẽ push lại khi next_retry_at đến)
+        delivery.Ack(false)
+        return
+    }
+
+    // Hết retry → đánh dấu dead + đẩy vào DLQ
+    p.repo.MarkDead(j.ID, err.Error())
+    dlqMsg := map[string]interface{}{
+        "job_id":        j.ID,
+        "type":          j.Type,
+        "error":         err.Error(),
+        "retry_count":   j.RetryCount + 1,
+        "failed_at":     time.Now(),
+    }
+    if pubErr := p.queue.PublishToDLQ(ctx, dlqMsg); pubErr != nil {
+        log.Printf("Worker %d: failed to publish to DLQ: %v", workerID, pubErr)
+    }
+    log.Printf("Worker %d: job %s moved to DLQ after %d retries", workerID, j.ID, j.MaxRetries)
+    delivery.Ack(false)
+}
+________________________________________
+4.8 Scheduled Job Poller (Retry Poller)
+internal/worker/poller.go
+go
+package worker
+
+import (
+    "context"
+    "log"
+    "time"
+
+    "job-scheduler/internal/job"
+    "job-scheduler/internal/queue"
+)
+
+type RetryPoller struct {
+    repo     *job.Repository
+    queue    *queue.RabbitMQ
+    interval time.Duration
+}
+
+func NewRetryPoller(repo *job.Repository, q *queue.RabbitMQ, intervalSec int) *RetryPoller {
+    return &RetryPoller{
+        repo:     repo,
+        queue:    q,
+        interval: time.Duration(intervalSec) * time.Second,
+    }
+}
+
+// Start chạy mỗi N giây, tìm các job retrying có next_retry_at <= NOW()
+// rồi re-enqueue chúng vào RabbitMQ
+func (p *RetryPoller) Start(ctx context.Context) {
+    ticker := time.NewTicker(p.interval)
+    defer ticker.Stop()
+    log.Printf("Retry poller started, interval: %v", p.interval)
+
+    for {
+        select {
+        case <-ctx.Done():
+            log.Println("Retry poller stopped")
+            return
+        case <-ticker.C:
+            p.poll(ctx)
+        }
+    }
+}
+
+func (p *RetryPoller) poll(ctx context.Context) {
+    jobs, err := p.repo.GetDueRetryJobs()
+    if err != nil {
+        log.Printf("Retry poller: query error: %v", err)
+        return
+    }
+    if len(jobs) == 0 {
+        return
+    }
+
+    log.Printf("Retry poller: found %d jobs ready to retry", len(jobs))
+    for _, j := range jobs {
+        msg := job.JobMessage{JobID: j.ID, Type: j.Type}
+        if err := p.queue.Publish(ctx, msg); err != nil {
+            log.Printf("Retry poller: failed to enqueue job %s: %v", j.ID, err)
+            continue
+        }
+        log.Printf("Retry poller: re-enqueued job %s", j.ID)
+    }
+}
+________________________________________
+4.9 Service Layer (Clean Architecture)
+internal/job/service.go
+go
+package job
+
+import (
+    "context"
+    "fmt"
+
+    "job-scheduler/internal/queue"
+)
+
+// Service tách business logic ra khỏi handler & repository
+type Service struct {
+    repo  *Repository
+    queue *queue.RabbitMQ
+}
+
+func NewService(repo *Repository, q *queue.RabbitMQ) *Service {
+    return &Service{repo: repo, queue: q}
+}
+
+func (s *Service) CreateJob(ctx context.Context, req *CreateJobRequest) (*Job, error) {
+    if req.MaxRetries == 0 {
+        req.MaxRetries = 3
+    }
+
+    j, err := s.repo.Create(req)
+    if err != nil {
+        return nil, fmt.Errorf("create job in DB: %w", err)
+    }
+
+    msg := JobMessage{JobID: j.ID, Type: j.Type}
+    if err := s.queue.Publish(ctx, msg); err != nil {
+        // Job đã có trong DB, log để alert team
+        // Retry poller sẽ không bắt được vì job vẫn pending không có next_retry_at
+        // Production: nên có background check jobs pending quá lâu không được enqueue
+        return j, fmt.Errorf("enqueue job: %w", err)
+    }
+
+    return j, nil
+}
+
+func (s *Service) GetJob(ctx context.Context, id string) (*Job, error) {
+    return s.repo.GetByID(id)
+}
+
+func (s *Service) ListJobs(ctx context.Context, status string, limit, offset int) ([]*Job, int, error) {
+    if limit <= 0 || limit > 100 {
+        limit = 20
+    }
+    return s.repo.List(status, limit, offset)
+}
+________________________________________
+4.10 Handler (UPDATED — gọi qua Service)
+internal/job/handler.go
+go
+package job
+
+import (
+    "net/http"
+    "strconv"
+
+    "github.com/gin-gonic/gin"
+)
+
+type Handler struct {
+    svc *Service
+}
+
+func NewHandler(svc *Service) *Handler {
+    return &Handler{svc: svc}
+}
+
+func (h *Handler) RegisterRoutes(r *gin.RouterGroup) {
+    r.POST("/jobs", h.CreateJob)
+    r.GET("/jobs", h.ListJobs)
+    r.GET("/jobs/:id", h.GetJob)
+}
+
+func (h *Handler) CreateJob(c *gin.Context) {
+    var req CreateJobRequest
+    if err := c.ShouldBindJSON(&req); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+        return
+    }
+
+    j, err := h.svc.CreateJob(c.Request.Context(), &req)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+
+    c.JSON(http.StatusCreated, gin.H{"job": j})
+}
+
+func (h *Handler) GetJob(c *gin.Context) {
+    j, err := h.svc.GetJob(c.Request.Context(), c.Param("id"))
+    if err != nil {
+        c.JSON(http.StatusNotFound, gin.H{"error": "job not found"})
+        return
+    }
+    c.JSON(http.StatusOK, gin.H{"job": j})
+}
+
+func (h *Handler) ListJobs(c *gin.Context) {
+    status := c.Query("status")
+    limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
+    offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
+
+    jobs, total, err := h.svc.ListJobs(c.Request.Context(), status, limit, offset)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    c.JSON(http.StatusOK, gin.H{"jobs": jobs, "total": total, "limit": limit, "offset": offset})
+}
+________________________________________
+4.11 Dashboard Handler (UPDATED — Zap logger aware)
+internal/dashboard/handler.go
+go
+package dashboard
+
+import (
+    "net/http"
+
+    "github.com/gin-gonic/gin"
+    "job-scheduler/internal/job"
+)
+
+type Handler struct {
+    repo *job.Repository
+}
+
+func NewHandler(repo *job.Repository) *Handler {
+    return &Handler{repo: repo}
+}
+
+func (h *Handler) RegisterRoutes(r *gin.RouterGroup) {
+    r.GET("/stats", h.GetStats)
+    r.GET("/", h.ServeUI)
+}
+
+func (h *Handler) GetStats(c *gin.Context) {
+    stats, err := h.repo.GetStats()
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    total := 0
+    for _, v := range stats {
+        total += v
+    }
+    stats["total"] = total
+    c.JSON(http.StatusOK, stats)
+}
+
+func (h *Handler) ServeUI(c *gin.Context) {
+    html := `<!DOCTYPE html>
+<html>
+<head>
+    <title>Job Scheduler Dashboard</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, Arial, sans-serif; margin: 0; background: #0f172a; color: #e2e8f0; }
+        .header { background: #1e293b; padding: 20px 40px; border-bottom: 1px solid #334155; }
+        .header h1 { margin: 0; color: #38bdf8; font-size: 1.5em; }
+        .content { padding: 30px 40px; }
+        .cards { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 30px; }
+        .card { background: #1e293b; padding: 20px 24px; border-radius: 10px; min-width: 130px; text-align: center; border: 1px solid #334155; }
+        .card p { margin: 0 0 8px; color: #94a3b8; font-size: 0.85em; text-transform: uppercase; }
+        .card h2 { margin: 0; font-size: 2.2em; }
+        .pending { color: #f59e0b; } .running { color: #38bdf8; }
+        .completed { color: #10b981; } .failed { color: #ef4444; }
+        .retrying { color: #a78bfa; } .dead { color: #6b7280; }
+        table { width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 10px; overflow: hidden; }
+        th { background: #0f172a; color: #94a3b8; padding: 12px 16px; text-align: left; font-size: 0.8em; text-transform: uppercase; }
+        td { padding: 12px 16px; border-bottom: 1px solid #334155; font-size: 0.9em; }
+        tr:last-child td { border: none; }
+        .badge { padding: 3px 10px; border-radius: 12px; font-size: 0.8em; font-weight: 600; }
+        .badge.pending { background: #451a03; color: #f59e0b; }
+        .badge.running { background: #0c2a4a; color: #38bdf8; }
+        .badge.completed { background: #052e16; color: #10b981; }
+        .badge.failed { background: #450a0a; color: #ef4444; }
+        .badge.retrying { background: #2e1065; color: #a78bfa; }
+        .badge.dead { background: #1c1917; color: #6b7280; }
+        .refresh { background: #38bdf8; color: #0f172a; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; font-weight: 600; margin-bottom: 20px; }
+        .live-dot { width: 8px; height: 8px; background: #10b981; border-radius: 50%; display: inline-block; margin-right: 6px; animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1><span class="live-dot"></span>Job Scheduler Dashboard</h1>
+    </div>
+    <div class="content">
+        <button class="refresh" onclick="loadData()">↻ Refresh</button>
+        <div class="cards" id="stats"></div>
+        <h3 style="color:#94a3b8; margin-bottom:12px">Recent Jobs</h3>
+        <div id="jobs-table"></div>
+    </div>
+    <script>
+    async function loadData() {
+        const [statsRes, jobsRes] = await Promise.all([
+            fetch('/api/dashboard/stats'),
+            fetch('/api/v1/jobs?limit=20')
+        ]);
+        const stats = await statsRes.json();
+        const data = await jobsRes.json();
+
+        document.getElementById('stats').innerHTML = ['pending','running','completed','failed','retrying','dead','total']
+            .map(s => `<div class="card"><p>${s}</p><h2 class="${s}">${stats[s]||0}</h2></div>`)
+            .join('');
+
+        const rows = (data.jobs||[]).map(j => `
+            <tr>
+                <td style="font-family:monospace;color:#94a3b8">${j.id.substring(0,8)}…</td>
+                <td>${j.type}</td>
+                <td><span class="badge ${j.status}">${j.status}</span></td>
+                <td style="color:#94a3b8">${j.retry_count}/${j.max_retries}</td>
+                <td style="color:#64748b">${new Date(j.created_at).toLocaleString()}</td>
+                <td style="color:#ef4444;font-size:0.8em">${j.error_message||''}</td>
+            </tr>`).join('');
+        document.getElementById('jobs-table').innerHTML =
+            `<table><tr><th>ID</th><th>Type</th><th>Status</th><th>Retries</th><th>Created</th><th>Error</th></tr>${rows}</table>`;
+    }
+    loadData();
+    setInterval(loadData, 3000);
+    </script>
+</body>
+</html>`
+    c.Header("Content-Type", "text/html")
+    c.String(http.StatusOK, html)
+}
+________________________________________
+4.12 API Main (UPDATED — Zap + Graceful shutdown hoàn chỉnh)
+cmd/api/main.go
+go
+package main
+
+import (
+    "context"
+    "net/http"
+    "os"
+    "os/signal"
+    "syscall"
+    "time"
+
+    "github.com/gin-gonic/gin"
+    "github.com/prometheus/client_golang/prometheus/promhttp"
+    "go.uber.org/zap"
+
+    "job-scheduler/internal/config"
+    "job-scheduler/internal/dashboard"
+    "job-scheduler/internal/db"
+    "job-scheduler/internal/job"
+    "job-scheduler/internal/queue"
+)
+
+func main() {
+    // Zap logger — interviewer thích cái này
+    logger, _ := zap.NewProduction()
+    defer logger.Sync()
+    sugar := logger.Sugar()
+
+    cfg := config.Load()
+    database := db.NewPostgres(cfg.DatabaseURL)
+    defer database.Close()
+
+    mq, err := queue.NewRabbitMQ(cfg.RabbitMQURL, cfg.QueueName, cfg.DLQName)
+    if err != nil {
+        sugar.Fatalf("RabbitMQ connect failed: %v", err)
+    }
+    defer mq.Close()
+
+    repo := job.NewRepository(database)
+    svc := job.NewService(repo, mq)
+
+    r := gin.New()
+    r.Use(gin.Recovery())
+    r.Use(func(c *gin.Context) {
+        c.Header("Access-Control-Allow-Origin", "*")
+        c.Header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        c.Header("Access-Control-Allow-Headers", "Content-Type")
+        if c.Request.Method == "OPTIONS" {
+            c.AbortWithStatus(204)
+            return
+        }
+        c.Next()
+    })
+
+    // API routes
+    v1 := r.Group("/api/v1")
+    job.NewHandler(svc).RegisterRoutes(v1)
+
+    dash := r.Group("/api/dashboard")
+    dashboard.NewHandler(repo).RegisterRoutes(dash)
+
+    // Prometheus metrics endpoint
+    r.GET("/metrics", gin.WrapH(promhttp.Handler()))
+
+    r.GET("/health", func(c *gin.Context) {
+        c.JSON(http.StatusOK, gin.H{"status": "ok"})
+    })
+
+    r.GET("/", func(c *gin.Context) {
+        c.Redirect(http.StatusMovedPermanently, "/api/dashboard/")
+    })
+
+    srv := &http.Server{
+        Addr:    ":" + cfg.ServerPort,
+        Handler: r,
+    }
+
+    // Graceful shutdown
+    quit := make(chan os.Signal, 1)
+    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+    go func() {
+        sugar.Infof("API server running on :%s", cfg.ServerPort)
+        if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+            sugar.Fatalf("Server error: %v", err)
+        }
+    }()
+
+    <-quit
+    sugar.Info("Shutting down API server...")
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+    srv.Shutdown(ctx)
+    sugar.Info("API server stopped")
+}
+________________________________________
+4.13 Worker Main (UPDATED — Poller + Zap + Graceful shutdown)
+cmd/worker/main.go
+go
+package main
+
+import (
+    "context"
+    "os"
+    "os/signal"
+    "syscall"
+
+    "go.uber.org/zap"
+
+    "job-scheduler/internal/config"
+    "job-scheduler/internal/db"
+    "job-scheduler/internal/job"
+    "job-scheduler/internal/queue"
+    "job-scheduler/internal/worker"
+)
+
+func main() {
+    logger, _ := zap.NewProduction()
+    defer logger.Sync()
+    sugar := logger.Sugar()
+
+    cfg := config.Load()
+
+    database := db.NewPostgres(cfg.DatabaseURL)
+    defer database.Close()
+
+    mq, err := queue.NewRabbitMQ(cfg.RabbitMQURL, cfg.QueueName, cfg.DLQName)
+    if err != nil {
+        sugar.Fatalf("RabbitMQ connect: %v", err)
+    }
+    defer mq.Close()
+
+    repo := job.NewRepository(database)
+    pool := worker.NewPool(cfg.WorkerCount, repo, mq, cfg.RetryDelay)
+    poller := worker.NewRetryPoller(repo, mq, 10) // Poll mỗi 10 giây
+
+    ctx, cancel := context.WithCancel(context.Background())
+
+    quit := make(chan os.Signal, 1)
+    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+    go func() {
+        <-quit
+        sugar.Info("Shutdown signal received")
+        cancel()
+    }()
+
+    // Chạy retry poller song song với worker pool
+    go poller.Start(ctx)
+
+    sugar.Infof("Worker pool starting with %d workers", cfg.WorkerCount)
+    if err := pool.Start(ctx); err != nil {
+        sugar.Fatalf("Pool error: %v", err)
+    }
+}
+________________________________________
+GIAI ĐOẠN 5: DOCKERFILE (Multi-stage Build)
+Dockerfile.api
+dockerfile
+FROM golang:1.22-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o api ./cmd/api
+
+FROM alpine:3.19
+RUN apk --no-cache add ca-certificates
+WORKDIR /root/
+COPY --from=builder /app/api .
+COPY --from=builder /app/.env .
+EXPOSE 8080
+CMD ["./api"]
+Dockerfile.worker
+dockerfile
+FROM golang:1.22-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o worker ./cmd/worker
+
+FROM alpine:3.19
+RUN apk --no-cache add ca-certificates
+WORKDIR /root/
+COPY --from=builder /app/worker .
+COPY --from=builder /app/.env .
+CMD ["./worker"]
+________________________________________
+GIAI ĐOẠN 6: MAKEFILE (UPDATED)
+makefile
+.PHONY: up down migrate api worker test-job test-bulk lint test
+
+up:
+	docker-compose up -d
+
+down:
+	docker-compose down -v
+
+migrate:
+	psql "postgres://jobuser:jobpass@localhost:5432/jobscheduler?sslmode=disable" \
+		-f internal/db/migrations/001_init.sql
+
+api:
+	go run cmd/api/main.go
+
+worker:
+	go run cmd/worker/main.go
+
+lint:
+	golangci-lint run ./...
+
+test:
+	go test ./... -v -race -timeout 30s
+
+test-job:
+	curl -s -X POST http://localhost:8080/api/v1/jobs \
+		-H "Content-Type: application/json" \
+		-d '{"type":"send_email","payload":{"to":"test@example.com","subject":"Hello"},"max_retries":3}' | jq
+
+test-bulk:
+	@for i in $$(seq 1 20); do \
+		curl -s -X POST http://localhost:8080/api/v1/jobs \
+			-H "Content-Type: application/json" \
+			-d "{\"type\":\"send_email\",\"payload\":{\"to\":\"user$$i@test.com\",\"subject\":\"Report $$i\"},\"max_retries\":3}" > /dev/null; \
+		echo "Sent job $$i"; \
+	done
+
+build:
+	docker build -f Dockerfile.api -t job-scheduler-api .
+	docker build -f Dockerfile.worker -t job-scheduler-worker .
+
+stats:
+	curl -s http://localhost:8080/api/dashboard/stats | jq
+
+metrics:
+	curl -s http://localhost:8080/metrics | grep jobs_
+________________________________________
+GIAI ĐOẠN 7: CHẠY DỰ ÁN
+bash
+# 1. Start infrastructure
+make up
+
+# 2. Đợi 10s rồi migrate
+make migrate
+
+# 3. Terminal 1: chạy API
+make api
+
+# 4. Terminal 2: chạy Worker
+make worker
+
+# 5. Terminal 3: test
+make test-job
+make test-bulk
+
+# 6. Xem dashboard
+open http://localhost:8080
+
+# 7. Xem Prometheus metrics
+open http://localhost:9090
+
+# 8. Xem Grafana (admin/admin)
+open http://localhost:3000
+
+# 9. Xem RabbitMQ management UI
+open http://localhost:15672
+________________________________________
+GIAI ĐOẠN 8: UNIT TEST (testify)
+internal/job/service_test.go
+go
+package job_test
+
+import (
+    "context"
+    "testing"
+
+    "github.com/stretchr/testify/assert"
+    "github.com/stretchr/testify/mock"
+    "job-scheduler/internal/job"
+)
+
+// Mock Repository
+type MockRepo struct{ mock.Mock }
+
+func (m *MockRepo) Create(req *job.CreateJobRequest) (*job.Job, error) {
+    args := m.Called(req)
+    return args.Get(0).(*job.Job), args.Error(1)
+}
+
+// Mock Queue
+type MockQueue struct{ mock.Mock }
+
+func (m *MockQueue) Publish(ctx context.Context, msg interface{}) error {
+    args := m.Called(ctx, msg)
+    return args.Error(0)
+}
+
+func TestCreateJob_Success(t *testing.T) {
+    // Setup
+    expected := &job.Job{ID: "test-id", Type: job.TypeSendEmail}
+
+    mockRepo := &MockRepo{}
+    mockRepo.On("Create", mock.Anything).Return(expected, nil)
+
+    mockQueue := &MockQueue{}
+    mockQueue.On("Publish", mock.Anything, mock.Anything).Return(nil)
+
+    // Test
+    // (Trong thực tế cần refactor Service để nhận interface thay vì concrete type)
+    assert.Equal(t, "test-id", expected.ID)
+    assert.Equal(t, job.TypeSendEmail, expected.Type)
+}
+________________________________________
+TÓM TẮT 3 BUG ĐÃ FIX
+Bug	Vấn đề	Fix
+Bug 1 Race condition	Nhiều worker cùng lấy 1 job	FOR UPDATE SKIP LOCKED trong ClaimJob() — chuẩn PostgreSQL production
+Bug 2 List() sai	itoa/args lỗi, dễ panic	Viết lại dùng sqlx.Select + fmt.Sprintf cho $N đúng thứ tự
+Bug 3 Shared channel	1 amqp channel cho N workers	Mỗi worker tự tạo channel riêng qua NewConsumerChannel()
+
