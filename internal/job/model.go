@@ -6,6 +6,7 @@ import (
 )
 
 type Status string
+type Type string
 
 const (
 	StatusPending   Status = "pending"
@@ -14,6 +15,13 @@ const (
 	StatusFailed    Status = "failed"
 	StatusRetrying  Status = "retrying"
 	StatusDead      Status = "dead"
+)
+
+const (
+	TypeSendEmail       Type = "send_email"
+	TypeProcessImage    Type = "process_image"
+	TypeGenerateReport  Type = "generate_report"
+	TypeDataCalculation Type = "data_calculation"
 )
 
 type Job struct {
@@ -35,11 +43,12 @@ type Job struct {
 	UpdatedAt time.Time `db:"updated_at"    json:"updated_at"`
 }
 
-// DTO
-type CreateJobRequest struct {
-	Type        string          `json:"type"         binding:"required"`
-	Payload     json.RawMessage `json:"payload"      binding:"required"` // Ép buộc client phải gửi payload
-	Priority    int             `json:"priority"`
-	MaxRetries  int             `json:"max_retries"`  // Nếu không gửi, lát nữa Default sẽ là 3
-	ScheduledAt *time.Time      `json:"scheduled_at"` // Lập lịch chạy tương lai
+// kiểm tra xem job có thể retry được không
+func (j *Job) CanRetry() bool {
+	return j.RetryCount < j.MaxRetries
+}
+
+type JobMessage struct {
+	JobID string `json:"job_id"`
+	Type  Type   `json:"type"`
 }
