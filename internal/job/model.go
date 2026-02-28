@@ -52,3 +52,11 @@ type JobMessage struct {
 	JobID string `json:"job_id"`
 	Type  Type   `json:"type"`
 }
+
+type CreateJobRequest struct {
+	Type        Type            `json:"type"         binding:"required"`
+	Payload     json.RawMessage `json:"payload"`
+	Priority    int             `json:"priority"`
+	MaxRetries  int             `json:"max_retries"`
+	ScheduledAt *time.Time      `json:"scheduled_at"`
+}
