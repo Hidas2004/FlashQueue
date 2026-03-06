@@ -36,7 +36,7 @@ func (s *Service) CreateJob(ctx context.Context, req *CreateJobRequest) (*Job, e
 		return nil, fmt.Errorf("không thể khởi tạo job trong DB: %w", err)
 	}
 	//đóng gói message và đẩy vào hàng đợi Queue để worker xử lý
-	msg := JobMessage{JobID: j.ID, Type: j.Type}
+	msg := JobMessage{JobID: j.ID, Type: Type(j.Type)}
 	//  Đã commit vào CSDL nhưng bắn qua Queue thất bại!
 	if err := s.publisher.Publish(ctx, msg); err != nil {
 		return j, fmt.Errorf("cảnh báo: lưu DB thành công nhưng push lên RabbitMQ thất bại: %w", err)
