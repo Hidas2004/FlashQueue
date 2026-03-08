@@ -76,6 +76,13 @@ func NewRabbitMQFromURL(url, queueName, dlqName string) (*RabbitMQ, error) {
 	}, nil
 }
 
+func (r *RabbitMQ) Close() error {
+	if r.conn != nil {
+		return r.conn.Close()
+	}
+	return nil
+}
+
 // 3. PUBLISHER IMPLEMENTATION
 type RabbitPublisher struct {
 	rmq *RabbitMQ
