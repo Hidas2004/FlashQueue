@@ -1,0 +1,16 @@
+﻿go : # job-scheduler/cmd/worker
+At line:1 char:1
++ go build ./cmd/worker 2> worker_err.log; Get-Content 
+worker_err.log | ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (# job-sche 
+   duler/cmd/worker:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+cmd\worker\main.go:31:19: undefined: queue.NewRabbitMQ
+cmd\worker\main.go:40:52: not enough arguments in call 
+to worker.NewPool
+	have (int, *job.Repository, unknown type, int)
+	want (int, *job.Repository, *queue.RabbitMQ, 
+queue.Publisher, *worker.Registry, 
+"job-scheduler/internal/metrics".Metrics, int)
