@@ -1,0 +1,14 @@
+﻿go : # job-scheduler/cmd/api
+At line:1 char:1
++ go build ./cmd/api 2> api_err.log; Get-Content 
+api_err.log | Set-Cont ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (# job-sche 
+   duler/cmd/api:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+cmd\api\main.go:40:19: undefined: queue.NewRabbitMQ
+cmd\api\main.go:55:27: undefined: dashboard.NewHandler
+cmd\api\main.go:77:13: jobHandler.RegisterRoutes 
+undefined (type *job.Handler has no field or method 
+RegisterRoutes)
